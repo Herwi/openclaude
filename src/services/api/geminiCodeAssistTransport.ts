@@ -40,9 +40,27 @@ type OpenAIMessageLike = {
     id: string
     type?: 'function'
     function: { name: string; arguments: string }
+    extra_content?: Record<string, unknown>
   }>
   tool_call_id?: string
   name?: string
+}
+
+// Magic value used by openaiShim's convertMessages to "ask" Google's
+// OpenAI-compat layer to skip thought-signature validation. It does not have
+// any meaning for the native Code Assist endpoint; we must NOT forward it as
+// a real signature, otherwise the server will reject it as malformed.
+const SKIP_THOUGHT_SIGNATURE_PLACEHOLDER = 'skip_thought_signature_validator'
+
+function extractThoughtSignature(
+  extraContent: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!extraContent) return undefined
+  const google = extraContent.google as Record<string, unknown> | undefined
+  const value = google?.thought_signature
+  if (typeof value !== 'string') return undefined
+  if (!value || value === SKIP_THOUGHT_SIGNATURE_PLACEHOLDER) return undefined
+  return value
 }
 
 type OpenAIToolLike = {
@@ -69,7 +87,15 @@ type OpenAIRequestBody = {
 type GeminiPart =
   | { text: string }
   | { inlineData: { mimeType: string; data: string } }
-  | { functionCall: { name: string; args: Record<string, unknown> } }
+  | {
+      functionCall: { name: string; args: Record<string, unknown> }
+      // Gemini requires this echoed back on every replayed function call so it
+      // can prove the call really came from a previous model turn (and wasn't
+      // forged by the client). Code Assist returns it on response parts and
+      // expects the same value on the corresponding part in the next turn's
+      // contents.
+      thoughtSignature?: string
+    }
   | { functionResponse: { name: string; response: Record<string, unknown> } }
 
 type GeminiContent = {
@@ -202,8 +228,9 @@ export function translateOpenAIRequestToGemini(
   let systemInstruction: GeminiRequest['systemInstruction']
 
   // Tool-call name lookup: Gemini's functionResponse parts need a `name`, but
-  // OpenAI's tool-role messages only have `tool_call_id`. Walk backwards to
-  // find the matching tool_call emitted by a prior assistant turn.
+  // OpenAI's tool-role messages only carry `tool_call_id`. Build a map as we
+  // process assistant turns so that a later 'tool' role message can resolve
+  // its function name.
   const toolCallIdToName = new Map<string, string>()
 
   for (const msg of body.messages) {
@@ -237,11 +264,13 @@ export function translateOpenAIRequestToGemini(
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           toolCallIdToName.set(tc.id, tc.function.name)
+          const signature = extractThoughtSignature(tc.extra_content)
           parts.push({
             functionCall: {
               name: tc.function.name,
               args: stringToRecord(tc.function.arguments),
             },
+            ...(signature ? { thoughtSignature: signature } : {}),
           })
         }
       }
@@ -329,13 +358,19 @@ export function translateOpenAIRequestToGemini(
   return request
 }
 
+type GeminiResponsePart = {
+  text?: string
+  functionCall?: { name?: string; args?: Record<string, unknown> }
+  // Gemini stamps replay-validation tokens on parts that came from the model
+  // turn. We must echo the same value back on the corresponding part in the
+  // next turn's contents, otherwise the server rejects the replay.
+  thoughtSignature?: string
+}
+
 type GeminiCandidate = {
   content?: {
     role?: string
-    parts?: Array<{
-      text?: string
-      functionCall?: { name?: string; args?: Record<string, unknown> }
-    }>
+    parts?: GeminiResponsePart[]
   }
   finishReason?: string
 }
@@ -392,11 +427,20 @@ export function translateGeminiResponseToOpenAI(
     id: string
     type: 'function'
     function: { name: string; arguments: string }
+    extra_content?: Record<string, unknown>
   }> = []
   for (const part of parts) {
     if (typeof part.text === 'string' && part.text) {
       textChunks.push(part.text)
     } else if (part.functionCall?.name) {
+      // Surface Gemini's thoughtSignature back through extra_content.google so
+      // openaiShim's _convertNonStreamingResponse promotes it to the Anthropic
+      // tool_use block as `signature`. Without this round-trip Code Assist
+      // rejects the next turn's replayed function call.
+      const extraContent =
+        typeof part.thoughtSignature === 'string' && part.thoughtSignature
+          ? { google: { thought_signature: part.thoughtSignature } }
+          : undefined
       toolCalls.push({
         id: newToolCallId(),
         type: 'function',
@@ -404,6 +448,7 @@ export function translateGeminiResponseToOpenAI(
           name: part.functionCall.name,
           arguments: JSON.stringify(part.functionCall.args ?? {}),
         },
+        ...(extraContent ? { extra_content: extraContent } : {}),
       })
     }
   }
@@ -503,6 +548,10 @@ function makeOpenAIShimStream(
           emittedRole = true
         }
         const index = toolCallIndex++
+        const extraContent =
+          typeof part.thoughtSignature === 'string' && part.thoughtSignature
+            ? { google: { thought_signature: part.thoughtSignature } }
+            : undefined
         controller.enqueue(
           encodeChunk({
             tool_calls: [
@@ -514,6 +563,7 @@ function makeOpenAIShimStream(
                   name: part.functionCall.name,
                   arguments: JSON.stringify(part.functionCall.args ?? {}),
                 },
+                ...(extraContent ? { extra_content: extraContent } : {}),
               },
             ],
           }),

@@ -66,6 +66,63 @@ describe('translateOpenAIRequestToGemini', () => {
     ])
   })
 
+  test('forwards a real Gemini thought_signature on replayed tool_calls', () => {
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [
+        { role: 'user', content: 'read foo' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'Read', arguments: '{}' },
+              extra_content: {
+                google: { thought_signature: 'real-sig-abc' },
+              },
+            },
+          ],
+        },
+      ],
+    })
+    expect(gemini.contents[1].parts[0]).toEqual({
+      functionCall: { name: 'Read', args: {} },
+      thoughtSignature: 'real-sig-abc',
+    })
+  })
+
+  test('drops the openaiShim placeholder thought_signature instead of forwarding it to Code Assist', () => {
+    // openaiShim's convertMessages stamps "skip_thought_signature_validator"
+    // when there is no real Gemini signature to replay. That magic string is
+    // a bypass for Google's OpenAI-compat layer and would be rejected as
+    // malformed if forwarded to native Code Assist.
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'Read', arguments: '{}' },
+              extra_content: {
+                google: {
+                  thought_signature: 'skip_thought_signature_validator',
+                },
+              },
+            },
+          ],
+        },
+      ],
+    })
+    expect(gemini.contents[0].parts[0]).toEqual({
+      functionCall: { name: 'Read', args: {} },
+    })
+    expect((gemini.contents[0].parts[0] as Record<string, unknown>).thoughtSignature).toBeUndefined()
+  })
+
   test('maps tools[] to Gemini functionDeclarations', () => {
     const gemini = translateOpenAIRequestToGemini({
       messages: [{ role: 'user', content: 'x' }],
@@ -183,6 +240,90 @@ describe('translateGeminiResponseToOpenAI', () => {
     const first = toolCalls[0] as { function: { name: string; arguments: string } }
     expect(first.function.name).toBe('Read')
     expect(JSON.parse(first.function.arguments)).toEqual({ path: 'foo' })
+  })
+
+  test('surfaces Gemini thoughtSignature back through extra_content.google so the next turn can replay it', () => {
+    const openai = translateGeminiResponseToOpenAI(
+      {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  functionCall: { name: 'Read', args: { path: 'foo' } },
+                  thoughtSignature: 'sig-from-gemini',
+                },
+              ],
+            },
+            finishReason: 'STOP',
+          },
+        ],
+      },
+      'gemini-2.5-pro',
+    )
+    const choice = (openai.choices as Array<Record<string, unknown>>)[0]
+    const message = choice.message as Record<string, unknown>
+    const toolCalls = message.tool_calls as Array<{
+      extra_content?: { google?: { thought_signature?: string } }
+    }>
+    expect(toolCalls[0].extra_content?.google?.thought_signature).toBe(
+      'sig-from-gemini',
+    )
+  })
+
+  test('round-trips a real Gemini thought_signature through both translation directions', () => {
+    // Simulate a multi-turn conversation: Code Assist returns a functionCall
+    // with a thoughtSignature, openaiShim forwards it back to Claude Code,
+    // Claude Code includes it in the next turn's tool_calls — and the
+    // outbound translator MUST place it on the corresponding Gemini part.
+    const inbound = translateGeminiResponseToOpenAI(
+      {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  functionCall: { name: 'Read', args: { path: 'foo' } },
+                  thoughtSignature: 'round-trip-sig',
+                },
+              ],
+            },
+            finishReason: 'STOP',
+          },
+        ],
+      },
+      'gemini-2.5-pro',
+    )
+    const inboundChoice = (inbound.choices as Array<Record<string, unknown>>)[0]
+    const inboundToolCalls = (inboundChoice.message as { tool_calls: Array<{
+      id: string
+      type: 'function'
+      function: { name: string; arguments: string }
+      extra_content?: Record<string, unknown>
+    }> }).tool_calls
+
+    const outbound = translateOpenAIRequestToGemini({
+      messages: [
+        { role: 'user', content: 'read foo' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: inboundToolCalls,
+        },
+        {
+          role: 'tool',
+          tool_call_id: inboundToolCalls[0].id,
+          content: 'file contents',
+        },
+      ],
+    })
+
+    const modelTurn = outbound.contents[1]
+    expect(modelTurn.role).toBe('model')
+    expect(modelTurn.parts[0]).toEqual({
+      functionCall: { name: 'Read', args: { path: 'foo' } },
+      thoughtSignature: 'round-trip-sig',
+    })
   })
 
   test('unwraps Code Assist response wrappers', () => {
