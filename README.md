@@ -103,7 +103,7 @@ Advanced and source-build guides:
 | Provider | Setup Path | Notes |
 | --- | --- | --- |
 | OpenAI-compatible | `/provider` or env vars | Works with OpenAI, OpenRouter, DeepSeek, Groq, Mistral, LM Studio, and other compatible `/v1` servers |
-| Gemini | `/provider` or env vars | Supports API key, access token, or local ADC workflow on current `main` |
+| Gemini | `/provider` or env vars | Supports API key, access token, local ADC workflow, or the experimental Gemini CLI OAuth reuse mode (see [Experimental: Gemini CLI OAuth reuse](#experimental-gemini-cli-oauth-reuse)) |
 | GitHub Models | `/onboard-github` | Interactive onboarding with saved credentials |
 | Codex | `/provider` | Uses existing Codex credentials when available |
 | Ollama | `/provider` or env vars | Local inference with no API key |
@@ -184,6 +184,57 @@ With Firecrawl enabled:
 - `WebFetch` uses Firecrawl's scrape endpoint instead of raw HTTP, handling JS-rendered pages correctly
 
 Free tier at [firecrawl.dev](https://firecrawl.dev) includes 500 credits. The key is optional.
+
+---
+
+## Experimental: Gemini CLI OAuth reuse
+
+> **Warning — local experimentation only.** This mode reuses the OAuth credentials cached on disk by Google's `gemini` CLI to drive Gemini through OpenClaude. Doing this from a third-party client is **against Google's terms of service** and must not be distributed, published, or used in production. It exists here so contributors can prove the transport layer works end-to-end against Google Code Assist with a real Google account, without a public Gemini API key. If you are not deliberately opting in to that constraint, use the regular API-key, access-token, or ADC Gemini modes instead.
+>
+> This path does not use `generativelanguage.googleapis.com`. It calls the Code Assist API (`cloudcode-pa.googleapis.com/v1internal`) directly, speaking native Gemini `generateContent`. Translation between OpenAI-chat wire format and Gemini happens inside `src/services/api/geminiCodeAssistTransport.ts`.
+
+### Prerequisites
+
+- Install and run `@google/gemini-cli` once. Complete the "Login with Google" flow so that `~/.gemini/oauth_creds.json` exists and contains a live `refresh_token`.
+- Optionally set `GOOGLE_CLOUD_PROJECT` to skip the Code Assist project lookup call. If unset, the transport calls `loadCodeAssist` on first use and caches the returned `cloudaicompanionProject` for ten minutes.
+- If you want OpenClaude to refresh its own access token when the cached one expires (rather than requiring you to re-run `gemini`), also export the public OAuth client values the Gemini CLI itself uses. They live in the published `@google/gemini-cli` npm package under `packages/core/src/code_assist/oauth2.ts`. Copy them into your shell:
+
+  ```bash
+  export GEMINI_CLI_OAUTH_CLIENT_ID=<client_id_from_gemini_cli_source>
+  export GEMINI_CLI_OAUTH_CLIENT_SECRET=<client_secret_from_gemini_cli_source>
+  ```
+
+  These are not stored in this repository. If both are missing and the cached token is still valid, OpenClaude will serve it without needing to refresh; if it is expired, the request fails with an actionable error instructing you to set these two env vars.
+
+### Run
+
+```bash
+export CLAUDE_CODE_USE_GEMINI=1
+export GEMINI_AUTH_MODE=cli-oauth
+# Optional — defaults to gemini-2.5-pro (the only model Code Assist free tier serves)
+export GEMINI_MODEL=gemini-2.5-pro
+# Optional — skips the loadCodeAssist network call
+export GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+
+openclaude
+```
+
+Or configure it inside the app: run `/provider`, pick **Gemini**, and choose **Gemini CLI login (experimental)** as the auth method. The wizard will detect `~/.gemini/oauth_creds.json` and persist `GEMINI_AUTH_MODE=cli-oauth` in your `.openclaude-profile.json`.
+
+### How it works
+
+- `src/utils/geminiCliOAuth.ts` reads `~/.gemini/oauth_creds.json`, refreshes the access token when the local `expiry_date` is past its refresh window, and writes the rotated token back to disk so the real `gemini` CLI and OpenClaude stay in sync.
+- `src/services/api/geminiCodeAssistTransport.ts` intercepts the HTTP call at the OpenAI-shim fetch site, translates the OpenAI chat-completion body into Gemini-native `generateContent`, POSTs to `cloudcode-pa.googleapis.com/v1internal`, and re-wraps the response as OpenAI-shaped JSON or SSE so the rest of `openaiShim.ts` sees the same wire format it expects from any other provider.
+- Tool calling works end-to-end, including multi-turn loops. The transport round-trips Gemini's `thoughtSignature` through `extra_content.google.thought_signature` so replayed `functionCall` parts pass Code Assist's anti-spoof check.
+- On a 401 from Code Assist, the transport force-refreshes the OAuth token and retries once. Beyond that, it surfaces a normal OpenAI-shaped error.
+
+### Known constraints
+
+- Free Code Assist tier only serves `gemini-2.5-pro`. If you force a different model via `GEMINI_MODEL`, Code Assist will reject the request.
+- If you have not completed Code Assist onboarding (accepting its terms inside the `gemini` CLI), `loadCodeAssist` returns no `cloudaicompanionProject`, and OpenClaude surfaces a 403 telling you to run `gemini` once and accept the terms.
+- The `GEMINI_CLI_OAUTH_CLIENT_ID` / `GEMINI_CLI_OAUTH_CLIENT_SECRET` values are deliberately not shipped with OpenClaude. You must copy them from the `@google/gemini-cli` npm package yourself. This is intentional: it keeps the secret-scanner off the repo and makes the terms-of-service opt-in explicit.
+
+Again: this is a private testing path. Do not publish forks or builds that bundle the OAuth client values or otherwise automate this behavior.
 
 ---
 
