@@ -395,6 +395,42 @@ test('gemini profiles require a key', () => {
   assert.equal(env, null)
 })
 
+test('gemini profiles support cli-oauth auth mode and default to gemini-2.5-pro', () => {
+  const env = buildGeminiProfileEnv({
+    authMode: 'cli-oauth',
+    processEnv: {},
+  })
+
+  assert.deepEqual(env, {
+    GEMINI_AUTH_MODE: 'cli-oauth',
+    GEMINI_MODEL: 'gemini-2.5-pro',
+  })
+})
+
+test('cli-oauth gemini profile round-trips through buildLaunchEnv without leaking API keys', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'gemini',
+    persisted: profile('gemini', {
+      GEMINI_AUTH_MODE: 'cli-oauth',
+      GEMINI_MODEL: 'gemini-2.5-pro',
+    }),
+    goal: 'balanced',
+    processEnv: {
+      // A stray GEMINI_API_KEY from the shell must not leak into the launch
+      // environment when the saved profile uses cli-oauth.
+      GEMINI_API_KEY: 'leaked-key',
+      GOOGLE_API_KEY: 'leaked-google-key',
+    },
+  })
+
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
+  assert.equal(env.GEMINI_AUTH_MODE, 'cli-oauth')
+  assert.equal(env.GEMINI_MODEL, 'gemini-2.5-pro')
+  assert.equal(env.GEMINI_API_KEY, undefined)
+  assert.equal(env.GOOGLE_API_KEY, undefined)
+  assert.equal(env.GEMINI_ACCESS_TOKEN, undefined)
+})
+
 test('saveProfileFile writes a profile that loadProfileFile can read back', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-profile-file-'))
 

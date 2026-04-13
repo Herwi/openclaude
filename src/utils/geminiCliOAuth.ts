@@ -173,6 +173,12 @@ type LoadGeminiCliTokenDeps = {
   fetchImpl?: typeof fetch
   now?: () => number
   write?: (creds: GeminiCliOAuthCredentials, path: string) => void
+  /**
+   * When true, ignore the cached `expiry_date` and always hit the OAuth token
+   * refresh endpoint. Used by the transport's 401-retry path when the server
+   * has already invalidated a token the local cache still thinks is fresh.
+   */
+  forceRefresh?: boolean
 }
 
 export async function loadGeminiCliOAuthToken(
@@ -183,7 +189,7 @@ export async function loadGeminiCliOAuthToken(
   const write = deps.write ?? writeGeminiCliOAuthCredentialsToDisk
   const creds = readGeminiCliOAuthCredentialsFromDisk(path)
   const expiry = typeof creds.expiry_date === 'number' ? creds.expiry_date : 0
-  if (expiry - REFRESH_WINDOW_MS > now()) {
+  if (!deps.forceRefresh && expiry - REFRESH_WINDOW_MS > now()) {
     return { accessToken: creds.access_token, expiryDate: expiry }
   }
   const refreshed = await refreshGeminiCliAccessToken(creds, deps.fetchImpl)

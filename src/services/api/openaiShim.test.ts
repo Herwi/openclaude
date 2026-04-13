@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createOpenAIShimClient } from './openaiShim.ts'
 
 type FetchType = typeof globalThis.fetch
@@ -19,6 +22,7 @@ const originalEnv = {
   GEMINI_BASE_URL: process.env.GEMINI_BASE_URL,
   GEMINI_MODEL: process.env.GEMINI_MODEL,
   GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT,
+  GEMINI_CLI_OAUTH_PATH: process.env.GEMINI_CLI_OAUTH_PATH,
   ANTHROPIC_CUSTOM_HEADERS: process.env.ANTHROPIC_CUSTOM_HEADERS,
 }
 
@@ -87,6 +91,7 @@ beforeEach(() => {
   delete process.env.GEMINI_BASE_URL
   delete process.env.GEMINI_MODEL
   delete process.env.GOOGLE_CLOUD_PROJECT
+  delete process.env.GEMINI_CLI_OAUTH_PATH
   delete process.env.ANTHROPIC_CUSTOM_HEADERS
 })
 
@@ -106,6 +111,7 @@ afterEach(() => {
   restoreEnv('GEMINI_BASE_URL', originalEnv.GEMINI_BASE_URL)
   restoreEnv('GEMINI_MODEL', originalEnv.GEMINI_MODEL)
   restoreEnv('GOOGLE_CLOUD_PROJECT', originalEnv.GOOGLE_CLOUD_PROJECT)
+  restoreEnv('GEMINI_CLI_OAUTH_PATH', originalEnv.GEMINI_CLI_OAUTH_PATH)
   restoreEnv('ANTHROPIC_CUSTOM_HEADERS', originalEnv.ANTHROPIC_CUSTOM_HEADERS)
   globalThis.fetch = originalFetch
 })
@@ -762,6 +768,96 @@ test('uses GEMINI_ACCESS_TOKEN for Gemini OpenAI-compatible requests', async () 
   )
   expect(capturedAuthorization).toBe('Bearer gemini-access-token')
   expect(capturedProject).toBe('gemini-project')
+})
+
+test('GEMINI_AUTH_MODE=cli-oauth routes through Code Assist instead of the Gemini OpenAI-compat endpoint', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'openclaude-cli-oauth-e2e-'))
+  const credsPath = join(tmpDir, 'oauth_creds.json')
+  writeFileSync(
+    credsPath,
+    JSON.stringify({
+      access_token: 'real-cli-token',
+      refresh_token: 'refresh',
+      // Far-future expiry so no token refresh HTTP call is made.
+      expiry_date: Date.now() + 24 * 60 * 60 * 1000,
+    }),
+  )
+
+  try {
+    process.env.CLAUDE_CODE_USE_GEMINI = '1'
+    process.env.GEMINI_AUTH_MODE = 'cli-oauth'
+    process.env.GEMINI_CLI_OAUTH_PATH = credsPath
+    // Project-id hint avoids the loadCodeAssist network call.
+    process.env.GOOGLE_CLOUD_PROJECT = 'cli-oauth-project'
+    delete process.env.OPENAI_BASE_URL
+    delete process.env.OPENAI_API_KEY
+    delete process.env.GEMINI_API_KEY
+    delete process.env.GOOGLE_API_KEY
+    delete process.env.GEMINI_ACCESS_TOKEN
+    delete process.env.GEMINI_MODEL
+
+    let codeAssistUrl: string | undefined
+    let codeAssistAuth: string | undefined
+    let codeAssistBody: Record<string, unknown> | undefined
+    let unexpectedGenerativelanguageCall = false
+
+    globalThis.fetch = (async (input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.includes('generativelanguage.googleapis.com')) {
+        // This is the exact regression the end-to-end wiring test exists to
+        // catch: in cli-oauth mode the shim must NOT hit the Gemini API.
+        unexpectedGenerativelanguageCall = true
+      }
+      if (url.includes('cloudcode-pa.googleapis.com')) {
+        codeAssistUrl = url
+        const headers = init?.headers as Record<string, string> | undefined
+        codeAssistAuth =
+          headers?.Authorization ?? headers?.authorization ?? undefined
+        codeAssistBody = JSON.parse(init?.body as string)
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: { parts: [{ text: 'pong from code assist' }] },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: {
+              promptTokenCount: 4,
+              candidatesTokenCount: 5,
+              totalTokenCount: 9,
+            },
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        )
+      }
+      throw new Error(`unexpected fetch to ${url}`)
+    }) as FetchType
+
+    const client = createOpenAIShimClient({}) as OpenAIShimClient
+    const result = (await client.beta.messages.create({
+      model: 'gemini-2.5-pro',
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 32,
+      stream: false,
+    })) as { content?: Array<{ type: string; text?: string }> }
+
+    expect(unexpectedGenerativelanguageCall).toBe(false)
+    expect(codeAssistUrl).toBeDefined()
+    expect(codeAssistUrl).toContain(':generateContent')
+    expect(codeAssistAuth).toBe('Bearer real-cli-token')
+    expect(codeAssistBody?.model).toBe('gemini-2.5-pro')
+    expect(codeAssistBody?.project).toBe('cli-oauth-project')
+    // Sanity: the Anthropic-shaped final response surfaces Gemini's text
+    // through both translation layers.
+    const text = result.content?.find(b => b.type === 'text')?.text
+    expect(text).toBe('pong from code assist')
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true })
+  }
 })
 
 test('preserves Gemini tool call extra_content from streaming chunks', async () => {

@@ -20,6 +20,15 @@ import {
 
 const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com'
 
+function newToolCallId(): string {
+  // crypto.randomUUID is available in both Node 18+ and Bun.
+  const id =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '')
+      : Math.random().toString(36).slice(2)
+  return `call_${id}`
+}
+
 type OpenAIContentPart =
   | { type: 'text'; text?: string }
   | { type: 'image_url'; image_url?: { url?: string } }
@@ -389,7 +398,7 @@ export function translateGeminiResponseToOpenAI(
       textChunks.push(part.text)
     } else if (part.functionCall?.name) {
       toolCalls.push({
-        id: `call_${toolCalls.length}_${Date.now().toString(36)}`,
+        id: newToolCallId(),
         type: 'function',
         function: {
           name: part.functionCall.name,
@@ -499,7 +508,7 @@ function makeOpenAIShimStream(
             tool_calls: [
               {
                 index,
-                id: `call_${index}_${Date.now().toString(36)}`,
+                id: newToolCallId(),
                 type: 'function',
                 function: {
                   name: part.functionCall.name,
@@ -607,11 +616,27 @@ export type GeminiCodeAssistFetchInit = {
   headers?: Record<string, string>
 }
 
+function errorResponse(
+  status: number,
+  message: string,
+  type: string,
+): Response {
+  return new Response(
+    JSON.stringify({ error: { message, type } }),
+    { status, headers: { 'Content-Type': 'application/json' } },
+  )
+}
+
 /**
  * Make a Code Assist call using the current OpenAI-format request body and
  * return a `Response` whose body is OpenAI-format JSON or SSE. Meant to be
  * used as a drop-in replacement for `fetch(base + '/chat/completions', …)`
  * inside `openaiShim.ts`.
+ *
+ * On a 401 from Code Assist, the OAuth token is force-refreshed and the
+ * request is retried once. This handles the case where the cached
+ * `expiry_date` is still "valid" in local time but the server has already
+ * revoked the token (clock skew, rotation, manual revocation).
  */
 export async function geminiCodeAssistFetch(
   init: GeminiCodeAssistFetchInit,
@@ -622,76 +647,92 @@ export async function geminiCodeAssistFetch(
   const loadToken = deps.loadToken ?? loadGeminiCliOAuthToken
   const resolveProject = deps.resolveProjectId ?? resolveGeminiCliProjectId
 
-  let token
-  try {
-    token = await loadToken()
-  } catch (err) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: (err as Error).message,
-          type: 'gemini_cli_oauth_error',
-        },
-      }),
-      { status: 401, headers: { 'Content-Type': 'application/json' } },
+  // Validate the request body at the boundary — the rest of this function
+  // trusts the OpenAI shape, and an upstream refactor that forgets to build
+  // `messages` would otherwise crash in translateOpenAIRequestToGemini with
+  // a confusing NPE instead of a clear error the user can act on.
+  if (!init.body || !Array.isArray(init.body.messages)) {
+    return errorResponse(
+      400,
+      'geminiCodeAssistFetch: request body is missing `messages[]`. This is a bug in openaiShim wiring.',
+      'gemini_code_assist_bad_request',
     )
   }
-  let projectId: string
-  try {
-    projectId = await resolveProject(token.accessToken)
-  } catch (err) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: (err as Error).message,
-          type: 'gemini_code_assist_onboarding_required',
-        },
-      }),
-      { status: 403, headers: { 'Content-Type': 'application/json' } },
+  if (!init.model) {
+    return errorResponse(
+      400,
+      'geminiCodeAssistFetch: `model` is required.',
+      'gemini_code_assist_bad_request',
     )
   }
 
   const geminiRequest = translateOpenAIRequestToGemini(init.body)
-  const envelope: CodeAssistEnvelope = {
-    model: init.model,
-    project: projectId,
-    request: geminiRequest,
-  }
-
   const streaming = init.body.stream === true
   const path = streaming
     ? '/v1internal:streamGenerateContent?alt=sse'
     : '/v1internal:generateContent'
   const url = `${endpoint.replace(/\/+$/, '')}${path}`
 
-  const response = await fetchImpl(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token.accessToken}`,
-      'x-goog-api-client': 'openclaude-gemini-cli-experimental',
-      ...(init.headers ?? {}),
-    },
-    body: JSON.stringify(envelope),
-    signal: init.signal,
-  })
+  async function postOnce(
+    forceRefresh: boolean,
+  ): Promise<{ response: Response; accessToken: string }> {
+    const token = await loadToken({ forceRefresh })
+    const projectId = await resolveProject(token.accessToken)
+    const envelope: CodeAssistEnvelope = {
+      model: init.model,
+      project: projectId,
+      request: geminiRequest,
+    }
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token.accessToken}`,
+        'x-goog-api-client': 'openclaude-gemini-cli-experimental',
+        ...(init.headers ?? {}),
+      },
+      body: JSON.stringify(envelope),
+      signal: init.signal,
+    })
+    return { response, accessToken: token.accessToken }
+  }
+
+  let response: Response
+  try {
+    ;({ response } = await postOnce(false))
+  } catch (err) {
+    // loadToken / resolveProject failures land here. Differentiate the two so
+    // the user sees an actionable message.
+    const message = (err as Error).message ?? 'unknown error'
+    if (/Code Assist loadCodeAssist|cloudaicompanionProject/i.test(message)) {
+      return errorResponse(403, message, 'gemini_code_assist_onboarding_required')
+    }
+    return errorResponse(401, message, 'gemini_cli_oauth_error')
+  }
+
+  // 401 → cached token is dead on the server. Force a refresh and retry once.
+  if (response.status === 401) {
+    // Drain the original body so the underlying connection can be reused.
+    await response.text().catch(() => {})
+    try {
+      ;({ response } = await postOnce(true))
+    } catch (err) {
+      return errorResponse(
+        401,
+        `Gemini CLI OAuth token refresh failed after 401: ${(err as Error).message}`,
+        'gemini_cli_oauth_error',
+      )
+    }
+  }
 
   if (!response.ok) {
-    // Re-wrap the error as an OpenAI-shaped error so the shim's existing
-    // parser surfaces it cleanly. Read the upstream body here rather than
-    // letting the shim double-consume the stream.
+    // Re-wrap upstream errors as OpenAI-shaped errors. Read the body here
+    // rather than letting the shim double-consume the stream.
     const text = await response.text().catch(() => '')
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `Code Assist ${response.status}: ${text.slice(0, 500)}`,
-          type: 'gemini_code_assist_error',
-        },
-      }),
-      {
-        status: response.status,
-        headers: { 'Content-Type': 'application/json' },
-      },
+    return errorResponse(
+      response.status,
+      `Code Assist ${response.status}: ${text.slice(0, 500)}`,
+      'gemini_code_assist_error',
     )
   }
 
@@ -705,14 +746,10 @@ export async function geminiCodeAssistFetch(
   }
 
   if (!response.body) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: 'Code Assist returned no stream body',
-          type: 'gemini_code_assist_error',
-        },
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } },
+    return errorResponse(
+      500,
+      'Code Assist returned no stream body',
+      'gemini_code_assist_error',
     )
   }
 

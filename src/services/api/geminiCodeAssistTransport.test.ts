@@ -363,4 +363,131 @@ describe('geminiCodeAssistFetch', () => {
     const body = (await response.json()) as { error?: { message?: string } }
     expect(body.error?.message).toContain('please re-login')
   })
+
+  test('rejects requests with a missing messages array without calling fetch', async () => {
+    let fetchCalls = 0
+    const fakeFetch = (async () => {
+      fetchCalls++
+      return new Response('')
+    }) as typeof fetch
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-pro',
+        // @ts-expect-error: intentionally malformed to exercise the guard
+        body: { stream: false },
+      },
+      {
+        fetchImpl: fakeFetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.status).toBe(400)
+    expect(fetchCalls).toBe(0)
+    const body = (await response.json()) as { error?: { message?: string } }
+    expect(body.error?.message).toContain('messages')
+  })
+
+  test('on a 401 response, force-refreshes the OAuth token and retries once', async () => {
+    const refreshCalls: Array<boolean | undefined> = []
+    const fetchBodies: string[] = []
+    let fetchCall = 0
+    const fakeFetch = (async (
+      _url: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      fetchCall++
+      fetchBodies.push(init?.body as string)
+      if (fetchCall === 1) {
+        return new Response(JSON.stringify({ error: 'token expired' }), {
+          status: 401,
+        })
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            { content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' },
+          ],
+        }),
+        { status: 200 },
+      )
+    }) as typeof fetch
+
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-pro',
+        body: {
+          messages: [{ role: 'user', content: 'ping' }],
+        },
+      },
+      {
+        fetchImpl: fakeFetch,
+        loadToken: async opts => {
+          refreshCalls.push(opts?.forceRefresh)
+          return {
+            accessToken: opts?.forceRefresh ? 'fresh-token' : 'stale-token',
+          }
+        },
+        resolveProjectId: async () => 'p',
+      },
+    )
+
+    expect(response.ok).toBe(true)
+    expect(refreshCalls).toEqual([false, true])
+    expect(fetchCall).toBe(2)
+    const json = (await response.json()) as {
+      choices: Array<{ message: { content: string } }>
+    }
+    expect(json.choices[0].message.content).toBe('ok')
+  })
+
+  test('surfaces a clear error when the retried request also fails', async () => {
+    const fakeFetch = (async () =>
+      new Response(
+        JSON.stringify({ error: 'still expired' }),
+        { status: 401 },
+      )) as typeof fetch
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-pro',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: fakeFetch,
+        loadToken: async opts => ({
+          accessToken: opts?.forceRefresh ? 'fresh' : 'stale',
+        }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.status).toBe(401)
+  })
+
+  test('generates tool_call ids that do not collide across parallel calls', async () => {
+    const openai = translateGeminiResponseToOpenAI(
+      {
+        candidates: [
+          {
+            content: {
+              parts: [
+                { functionCall: { name: 'A', args: { x: 1 } } },
+                { functionCall: { name: 'B', args: { x: 2 } } },
+                { functionCall: { name: 'C', args: { x: 3 } } },
+              ],
+            },
+            finishReason: 'STOP',
+          },
+        ],
+      },
+      'gemini-2.5-pro',
+    )
+    const choice = (openai.choices as Array<Record<string, unknown>>)[0]
+    const toolCalls = (choice.message as { tool_calls: Array<{ id: string }> })
+      .tool_calls
+    const ids = toolCalls.map(t => t.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const id of ids) {
+      expect(id).toMatch(/^call_[0-9a-f]{16,}$/)
+    }
+  })
 })
