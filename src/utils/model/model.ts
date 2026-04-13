@@ -266,20 +266,36 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
     const settings = getSettings_DEPRECATED() || {}
     return settings.model || process.env.OPENAI_MODEL || 'github:copilot'
   }
+  // For 3P providers, the `--model` flag from the CLI is stashed in
+  // mainLoopModelOverride before AppState exists. The "default" lookups
+  // below need to honour that override so that hooks which fall through
+  // getDefaultMainLoopModelSetting() (e.g. useMainLoopModel when AppState
+  // hasn't populated mainLoopModel yet, status line renders, early
+  // telemetry) display the model the user actually chose rather than the
+  // provider's hardcoded fallback. Without this, running
+  //   node dist/cli.mjs --model gemini-2.5-flash-lite
+  // would display "gemini-2.0-flash" in the logo even though API calls
+  // correctly used the requested model.
+  const thirdPartyOverride = getMainLoopModelOverride()
+  const override3P =
+    typeof thirdPartyOverride === 'string' && thirdPartyOverride.trim()
+      ? thirdPartyOverride.trim()
+      : undefined
+
   // Gemini provider: always use the configured Gemini model
   if (getAPIProvider() === 'gemini') {
-    return process.env.GEMINI_MODEL || 'gemini-2.0-flash'
+    return override3P || process.env.GEMINI_MODEL || 'gemini-2.0-flash'
   }
   if (getAPIProvider() === 'mistral') {
-    return process.env.MISTRAL_MODEL || 'devstral-latest'
+    return override3P || process.env.MISTRAL_MODEL || 'devstral-latest'
   }
   // OpenAI provider: always use the configured OpenAI model
   if (getAPIProvider() === 'openai') {
-    return process.env.OPENAI_MODEL || 'gpt-4o'
+    return override3P || process.env.OPENAI_MODEL || 'gpt-4o'
   }
   // Codex provider: always use the configured Codex model (default gpt-5.4)
   if (getAPIProvider() === 'codex') {
-    return process.env.OPENAI_MODEL || 'gpt-5.4'
+    return override3P || process.env.OPENAI_MODEL || 'gpt-5.4'
   }
 
   // Ants default to defaultModel from flag config, or Opus 1M if not configured
