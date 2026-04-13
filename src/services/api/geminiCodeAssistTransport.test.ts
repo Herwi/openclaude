@@ -177,6 +177,57 @@ describe('translateOpenAIRequestToGemini', () => {
     })
   })
 
+  test('clamps max_tokens=65536 down to 65535 (Code Assist exclusive upper bound)', () => {
+    // Regression: Claude Code's Sonnet-tier default max_tokens is 65536,
+    // which sits exactly on Code Assist's exclusive upper bound. Without
+    // clamping, every such request is rejected with a 400 INVALID_ARGUMENT
+    // before the model is even consulted.
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 65536,
+    })
+    expect(gemini.generationConfig?.maxOutputTokens).toBe(65535)
+  })
+
+  test('clamps values larger than 65535 down to 65535', () => {
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 200_000,
+    })
+    expect(gemini.generationConfig?.maxOutputTokens).toBe(65535)
+  })
+
+  test('raises zero / negative max_tokens to 1 (Code Assist inclusive lower bound)', () => {
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 0,
+    })
+    expect(gemini.generationConfig?.maxOutputTokens).toBe(1)
+
+    const gemini2 = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: -42,
+    })
+    expect(gemini2.generationConfig?.maxOutputTokens).toBe(1)
+  })
+
+  test('prefers max_completion_tokens over max_tokens but still clamps', () => {
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 100,
+      max_completion_tokens: 65536,
+    })
+    expect(gemini.generationConfig?.maxOutputTokens).toBe(65535)
+  })
+
+  test('leaves values inside the accepted range untouched', () => {
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 8192,
+    })
+    expect(gemini.generationConfig?.maxOutputTokens).toBe(8192)
+  })
+
   test('coalesces consecutive same-role contents', () => {
     const gemini = translateOpenAIRequestToGemini({
       messages: [

@@ -52,6 +52,19 @@ type OpenAIMessageLike = {
 // a real signature, otherwise the server will reject it as malformed.
 const SKIP_THOUGHT_SIGNATURE_PLACEHOLDER = 'skip_thought_signature_validator'
 
+// Code Assist enforces `1 <= maxOutputTokens < 65536`. Claude Code defaults
+// `max_tokens` to exactly 65536 for Sonnet-tier models, which sits on the
+// exclusive upper bound and produces a 400 INVALID_ARGUMENT. Clamp into the
+// server's accepted range before sending.
+const CODE_ASSIST_MAX_OUTPUT_TOKENS = 65535
+
+function clampMaxOutputTokens(value: number): number {
+  if (!Number.isFinite(value)) return CODE_ASSIST_MAX_OUTPUT_TOKENS
+  if (value < 1) return 1
+  if (value > CODE_ASSIST_MAX_OUTPUT_TOKENS) return CODE_ASSIST_MAX_OUTPUT_TOKENS
+  return Math.floor(value)
+}
+
 function extractThoughtSignature(
   extraContent: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -479,7 +492,9 @@ export function translateOpenAIRequestToGemini(
     generationConfig.temperature = body.temperature
   if (typeof body.top_p === 'number') generationConfig.topP = body.top_p
   const maxTokens = body.max_completion_tokens ?? body.max_tokens
-  if (typeof maxTokens === 'number') generationConfig.maxOutputTokens = maxTokens
+  if (typeof maxTokens === 'number') {
+    generationConfig.maxOutputTokens = clampMaxOutputTokens(maxTokens)
+  }
   if (Object.keys(generationConfig).length > 0) {
     request.generationConfig = generationConfig
   }
