@@ -214,6 +214,32 @@ type LoadCodeAssistResponse = {
   currentTier?: { id?: string; name?: string }
 }
 
+/**
+ * Map the current Node `process.platform` + `process.arch` to a value Google's
+ * Code Assist Platform enum accepts. Valid values are defined in the public
+ * `@google/gemini-cli` package and on the server as:
+ *
+ *   PLATFORM_UNSPECIFIED | DARWIN_AMD64 | DARWIN_ARM64 |
+ *   LINUX_AMD64 | LINUX_ARM64 | WINDOWS_AMD64 | WINDOWS_ARM64
+ *
+ * Sending anything else produces a 400 INVALID_ARGUMENT from the server.
+ */
+export function getCodeAssistPlatform(
+  proc: { platform: NodeJS.Platform; arch: string } = process,
+): string {
+  const archSuffix = proc.arch === 'arm64' ? 'ARM64' : 'AMD64'
+  switch (proc.platform) {
+    case 'darwin':
+      return `DARWIN_${archSuffix}`
+    case 'win32':
+      return `WINDOWS_${archSuffix}`
+    case 'linux':
+      return `LINUX_${archSuffix}`
+    default:
+      return 'PLATFORM_UNSPECIFIED'
+  }
+}
+
 async function callLoadCodeAssist(
   accessToken: string,
   fetchImpl: typeof fetch,
@@ -229,12 +255,7 @@ async function callLoadCodeAssist(
       body: JSON.stringify({
         metadata: {
           ideType: 'IDE_UNSPECIFIED',
-          platform:
-            process.platform === 'darwin'
-              ? 'DARWIN_ARM64'
-              : process.platform === 'win32'
-                ? 'PLATFORM_WINDOWS'
-                : 'LINUX_AMD64',
+          platform: getCodeAssistPlatform(),
           pluginType: 'GEMINI',
         },
       }),
@@ -242,8 +263,18 @@ async function callLoadCodeAssist(
   )
   const text = await response.text()
   if (!response.ok) {
+    // Don't lie about the cause. 401/403/404 are typically auth / onboarding
+    // and benefit from the "run gemini once" hint, but a 400 is almost
+    // always a client bug (bad enum, wrong shape) and telling the user to
+    // re-authenticate would send them on a wild goose chase.
+    const onboardingHint =
+      response.status === 401 ||
+      response.status === 403 ||
+      response.status === 404
+        ? ' Run `gemini` once and complete Code Assist onboarding if you have not already.'
+        : ''
     throw new Error(
-      `Code Assist loadCodeAssist failed (${response.status}): ${text.slice(0, 300)}. Run \`gemini\` once and accept the Code Assist terms.`,
+      `Code Assist loadCodeAssist failed (${response.status}): ${text.slice(0, 300)}.${onboardingHint}`,
     )
   }
   try {

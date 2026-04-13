@@ -463,6 +463,61 @@ describe('geminiCodeAssistFetch', () => {
     expect(finish?.choices?.[0]?.finish_reason).toBe('stop')
   })
 
+  test('classifies a loadCodeAssist 400 as a bad-request bug, not onboarding', async () => {
+    // Regression for a real user report: the user hit a 400 INVALID_ARGUMENT
+    // from loadCodeAssist because of a bad platform enum, but the transport
+    // was surfacing it as `gemini_code_assist_onboarding_required` with a
+    // "run gemini once and accept the terms" hint. That sent users on a
+    // wild goose chase — 400s are never fixed by re-authenticating.
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-pro',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: (async () =>
+          new Response('', { status: 200 })) as typeof fetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => {
+          throw new Error(
+            "Code Assist loadCodeAssist failed (400): Invalid value at 'metadata.platform' ...",
+          )
+        },
+      },
+    )
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as {
+      error?: { message?: string; type?: string }
+    }
+    expect(body.error?.type).toBe('gemini_code_assist_bad_request')
+    expect(body.error?.message).not.toContain('accept the Code Assist terms')
+    expect(body.error?.message).toContain('metadata.platform')
+  })
+
+  test('classifies loadCodeAssist 404 and missing project as onboarding', async () => {
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-pro',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: (async () =>
+          new Response('', { status: 200 })) as typeof fetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => {
+          throw new Error(
+            'Code Assist did not return a cloudaicompanionProject. Run `gemini` once and complete onboarding, or set GOOGLE_CLOUD_PROJECT explicitly.',
+          )
+        },
+      },
+    )
+    expect(response.status).toBe(403)
+    const body = (await response.json()) as {
+      error?: { type?: string }
+    }
+    expect(body.error?.type).toBe('gemini_code_assist_onboarding_required')
+  })
+
   test('returns an OpenAI-shaped error response when Code Assist fails', async () => {
     const fakeFetch = (async () =>
       new Response('boom', {

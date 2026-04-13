@@ -751,11 +751,27 @@ export async function geminiCodeAssistFetch(
   try {
     ;({ response } = await postOnce(false))
   } catch (err) {
-    // loadToken / resolveProject failures land here. Differentiate the two so
-    // the user sees an actionable message.
+    // loadToken / resolveProject failures land here. Differentiate between:
+    //  - onboarding / missing-project errors (403) — user should run gemini
+    //    once and accept Code Assist terms
+    //  - loadCodeAssist client-side errors like a 400 INVALID_ARGUMENT (400)
+    //    — these are bugs on our side, not something the user can fix by
+    //    re-authenticating
+    //  - OAuth loader errors (401) — stale / missing / unreadable creds
     const message = (err as Error).message ?? 'unknown error'
-    if (/Code Assist loadCodeAssist|cloudaicompanionProject/i.test(message)) {
+    if (/cloudaicompanionProject/i.test(message)) {
       return errorResponse(403, message, 'gemini_code_assist_onboarding_required')
+    }
+    const loadCodeAssistMatch = message.match(
+      /Code Assist loadCodeAssist failed \((\d{3})\)/i,
+    )
+    if (loadCodeAssistMatch) {
+      const upstreamStatus = Number(loadCodeAssistMatch[1])
+      const type =
+        upstreamStatus === 400
+          ? 'gemini_code_assist_bad_request'
+          : 'gemini_code_assist_onboarding_required'
+      return errorResponse(upstreamStatus, message, type)
     }
     return errorResponse(401, message, 'gemini_cli_oauth_error')
   }

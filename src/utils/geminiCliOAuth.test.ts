@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  getCodeAssistPlatform,
   getGeminiCliOAuthPath,
   loadGeminiCliOAuthToken,
   readGeminiCliOAuthCredentialsFromDisk,
@@ -50,6 +51,57 @@ afterEach(() => {
     'GEMINI_CLI_OAUTH_CLIENT_SECRET',
     originalEnv.GEMINI_CLI_OAUTH_CLIENT_SECRET,
   )
+})
+
+describe('getCodeAssistPlatform', () => {
+  // Code Assist rejects anything outside this set with a 400 INVALID_ARGUMENT
+  // on the first loadCodeAssist call — which was the original report that
+  // prompted this helper. Lock the mapping in so a drive-by refactor can't
+  // regress it back to garbage strings like "PLATFORM_WINDOWS".
+  test('Windows x64', () => {
+    expect(getCodeAssistPlatform({ platform: 'win32', arch: 'x64' })).toBe(
+      'WINDOWS_AMD64',
+    )
+  })
+
+  test('Windows arm64', () => {
+    expect(getCodeAssistPlatform({ platform: 'win32', arch: 'arm64' })).toBe(
+      'WINDOWS_ARM64',
+    )
+  })
+
+  test('macOS Apple Silicon', () => {
+    expect(getCodeAssistPlatform({ platform: 'darwin', arch: 'arm64' })).toBe(
+      'DARWIN_ARM64',
+    )
+  })
+
+  test('macOS Intel', () => {
+    expect(getCodeAssistPlatform({ platform: 'darwin', arch: 'x64' })).toBe(
+      'DARWIN_AMD64',
+    )
+  })
+
+  test('Linux x64', () => {
+    expect(getCodeAssistPlatform({ platform: 'linux', arch: 'x64' })).toBe(
+      'LINUX_AMD64',
+    )
+  })
+
+  test('Linux arm64', () => {
+    expect(getCodeAssistPlatform({ platform: 'linux', arch: 'arm64' })).toBe(
+      'LINUX_ARM64',
+    )
+  })
+
+  test('unknown platform falls back to UNSPECIFIED', () => {
+    expect(
+      getCodeAssistPlatform({
+        platform: 'freebsd' as NodeJS.Platform,
+        arch: 'x64',
+      }),
+    ).toBe('PLATFORM_UNSPECIFIED')
+  })
 })
 
 describe('getGeminiCliOAuthPath', () => {
