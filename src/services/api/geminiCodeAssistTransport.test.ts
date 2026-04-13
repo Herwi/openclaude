@@ -851,6 +851,93 @@ describe('geminiCodeAssistFetch', () => {
     expect(text.trim().endsWith('data: [DONE]')).toBe(true)
   })
 
+  test('preserves Code Assist Retry-After hint on 429 so withRetry honors it', async () => {
+    // Regression: free-tier Code Assist for gemini-2.5-flash-lite returns
+    // 429 with a human-readable "Your quota will reset after Ns" in the
+    // error message body. Previously errorResponse built a fresh Response
+    // with only Content-Type, discarding any upstream Retry-After header.
+    // That caused withRetry to fall back to its default exponential
+    // backoff, which blows through the remaining quota before the reset
+    // window elapses and compounds 429s on subsequent retries.
+    const upstreamBody = JSON.stringify({
+      error: {
+        code: 429,
+        message:
+          'You have exhausted your capacity on this model. Your quota will reset after 45s.',
+        status: 'RESOURCE_EXHAUSTED',
+      },
+    })
+    const fakeFetch = (async () =>
+      new Response(upstreamBody, { status: 429 })) as typeof fetch
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-flash-lite',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: fakeFetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.status).toBe(429)
+    expect(response.headers.get('Retry-After')).toBe('45')
+  })
+
+  test('parses minute and hour suffixes in Retry-After hints', async () => {
+    const upstreamBody = JSON.stringify({
+      error: { message: 'Your quota will reset after 2m.' },
+    })
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-flash-lite',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: (async () =>
+          new Response(upstreamBody, { status: 429 })) as typeof fetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.headers.get('Retry-After')).toBe('120')
+  })
+
+  test('prefers upstream Retry-After header over parsed message', async () => {
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-flash-lite',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: (async () =>
+          new Response('Your quota will reset after 999s.', {
+            status: 429,
+            headers: { 'Retry-After': '30' },
+          })) as typeof fetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.headers.get('Retry-After')).toBe('30')
+  })
+
+  test('omits Retry-After when neither header nor message hint is present', async () => {
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-flash-lite',
+        body: { messages: [{ role: 'user', content: 'x' }] },
+      },
+      {
+        fetchImpl: (async () =>
+          new Response('boom', { status: 503 })) as typeof fetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.headers.get('Retry-After')).toBeNull()
+  })
+
   test('classifies a loadCodeAssist 400 as a bad-request bug, not onboarding', async () => {
     // Regression for a real user report: the user hit a 400 INVALID_ARGUMENT
     // from loadCodeAssist because of a bad platform enum, but the transport

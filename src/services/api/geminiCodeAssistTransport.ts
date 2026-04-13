@@ -820,11 +820,45 @@ function errorResponse(
   status: number,
   message: string,
   type: string,
+  extraHeaders: Record<string, string> = {},
 ): Response {
   return new Response(
     JSON.stringify({ error: { message, type } }),
-    { status, headers: { 'Content-Type': 'application/json' } },
+    {
+      status,
+      headers: { 'Content-Type': 'application/json', ...extraHeaders },
+    },
   )
+}
+
+/**
+ * Extract a Retry-After hint (in seconds) for Code Assist responses, preserving
+ * the upstream's own `Retry-After` header when present and otherwise parsing
+ * the "Your quota will reset after Ns" / "after Nm" / "after Nh" copy that
+ * Code Assist puts in the user-facing 429 message body. Without this, our
+ * error wrapper strips the upstream header and withRetry falls back to naive
+ * exponential backoff, which blows through the remaining quota before the
+ * reset window has elapsed.
+ */
+function extractRetryAfterSeconds(
+  upstream: Response,
+  upstreamBody: string,
+): number | undefined {
+  const headerValue = upstream.headers.get('retry-after')
+  if (headerValue) {
+    const parsed = parseInt(headerValue, 10)
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed
+  }
+  const match = /reset after (\d+)(s|m|h)\b/i.exec(upstreamBody)
+  if (match) {
+    const n = parseInt(match[1], 10)
+    if (Number.isFinite(n) && n >= 0) {
+      if (match[2].toLowerCase() === 'h') return n * 3600
+      if (match[2].toLowerCase() === 'm') return n * 60
+      return n
+    }
+  }
+  return undefined
 }
 
 /**
@@ -883,6 +917,21 @@ export async function geminiCodeAssistFetch(
       project: projectId,
       request: geminiRequest,
     }
+    const postTs = Date.now()
+    if (process.env.GEMINI_CLI_OAUTH_DEBUG) {
+      const roles = init.body.messages.map(m => m.role).join(',')
+      const lastMsg = init.body.messages[init.body.messages.length - 1]
+      const lastContentPreview =
+        typeof lastMsg?.content === 'string'
+          ? lastMsg.content.slice(0, 80)
+          : Array.isArray(lastMsg?.content)
+            ? `[${lastMsg.content.length} parts]`
+            : ''
+      // eslint-disable-next-line no-console
+      console.error(
+        `[gemini-cli-oauth debug] POST ${new Date().toISOString().slice(11, 23)} model=${init.model} stream=${init.body.stream ?? false} roles=[${roles}] lastContent=${JSON.stringify(lastContentPreview)}`,
+      )
+    }
     const response = await fetchImpl(url, {
       method: 'POST',
       headers: {
@@ -894,6 +943,12 @@ export async function geminiCodeAssistFetch(
       body: JSON.stringify(envelope),
       signal: init.signal,
     })
+    if (process.env.GEMINI_CLI_OAUTH_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[gemini-cli-oauth debug] RESP ${new Date().toISOString().slice(11, 23)} status=${response.status} latency=${Date.now() - postTs}ms`,
+      )
+    }
     return { response, accessToken: token.accessToken }
   }
 
@@ -945,10 +1000,21 @@ export async function geminiCodeAssistFetch(
     // Re-wrap upstream errors as OpenAI-shaped errors. Read the body here
     // rather than letting the shim double-consume the stream.
     const text = await response.text().catch(() => '')
+    const retryAfterSeconds = extractRetryAfterSeconds(response, text)
+    const extraHeaders: Record<string, string> = {}
+    if (retryAfterSeconds !== undefined) {
+      // Preserve Code Assist's reset hint so withRetry honors it instead of
+      // naive exponential backoff. Naive backoff compounds 429s on free-tier
+      // Code Assist because our 20k-token tool-heavy prompts eat the per-
+      // minute quota in a single call; racing retries just keeps the bucket
+      // empty.
+      extraHeaders['Retry-After'] = String(retryAfterSeconds)
+    }
     return errorResponse(
       response.status,
       `Code Assist ${response.status}: ${text.slice(0, 500)}`,
       'gemini_code_assist_error',
+      extraHeaders,
     )
   }
 
