@@ -760,6 +760,97 @@ describe('geminiCodeAssistFetch', () => {
     expect(finish?.choices?.[0]?.finish_reason).toBe('stop')
   })
 
+  test('streaming parses CRLF-delimited SSE frames (real Code Assist framing)', async () => {
+    // Regression test for a critical bug caught by running against a live
+    // Code Assist endpoint: Google's streamGenerateContent uses CRLF line
+    // endings (`\r\n\r\n` between events), not LF (`\n\n`). A previous
+    // version of the stream decoder split on `\n\n` and never matched a
+    // single frame, causing every streaming response to be truncated to
+    // whatever the flush path happened to salvage from the first `data:`
+    // line — typically one or two words.
+    const encoder = new TextEncoder()
+    const geminiSseBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // Frame shape mirrors what Code Assist actually sends, including the
+        // top-level `response` wrapper and CRLF separators.
+        const frame1 = `data: ${JSON.stringify({
+          response: {
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ text: 'The' }] },
+              },
+            ],
+          },
+        })}\r\n\r\n`
+        const frame2 = `data: ${JSON.stringify({
+          response: {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      text: ' quick brown fox jumps over the lazy dog.',
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: {
+              promptTokenCount: 10,
+              candidatesTokenCount: 10,
+              totalTokenCount: 20,
+            },
+          },
+        })}\r\n\r\n`
+        // Split the stream across multiple chunks to also exercise partial-
+        // frame buffering.
+        const combined = frame1 + frame2
+        const mid = Math.floor(combined.length / 2)
+        controller.enqueue(encoder.encode(combined.slice(0, mid)))
+        controller.enqueue(encoder.encode(combined.slice(mid)))
+        controller.close()
+      },
+    })
+    const fakeFetch = (async () =>
+      new Response(geminiSseBody, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })) as typeof fetch
+
+    const response = await geminiCodeAssistFetch(
+      {
+        model: 'gemini-2.5-flash-lite',
+        body: {
+          model: 'gemini-2.5-flash-lite',
+          messages: [{ role: 'user', content: 'x' }],
+          stream: true,
+        },
+      },
+      {
+        fetchImpl: fakeFetch,
+        loadToken: async () => ({ accessToken: 'abc' }),
+        resolveProjectId: async () => 'p',
+      },
+    )
+    expect(response.ok).toBe(true)
+    const text = await response.text()
+    const frames = text.split('\n\n').filter(Boolean)
+    const datas = frames
+      .map(f => f.replace(/^data:\s*/, ''))
+      .filter(d => d && d !== '[DONE]')
+      .map(d => JSON.parse(d))
+    const content = datas
+      .flatMap(d => d.choices?.[0]?.delta?.content ?? [])
+      .join('')
+    // The whole sentence must survive, not just the first word.
+    expect(content).toBe('The quick brown fox jumps over the lazy dog.')
+    const finish = datas.find(d => d.choices?.[0]?.finish_reason)
+    expect(finish?.choices?.[0]?.finish_reason).toBe('stop')
+    expect(text.trim().endsWith('data: [DONE]')).toBe(true)
+  })
+
   test('classifies a loadCodeAssist 400 as a bad-request bug, not onboarding', async () => {
     // Regression for a real user report: the user hit a 400 INVALID_ARGUMENT
     // from loadCodeAssist because of a bad platform enum, but the transport

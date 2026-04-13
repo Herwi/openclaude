@@ -730,46 +730,52 @@ function makeOpenAIShimStream(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const reader = upstream.getReader()
+      // SSE frames are delimited by a blank line. The spec allows LF, CR, or
+      // CRLF line endings, but Google Code Assist's `streamGenerateContent`
+      // endpoint uses CRLF (`\r\n\r\n` between events) in practice. Normalize
+      // CRLF to LF as bytes come in so we can frame on `\n\n` consistently.
+      // An earlier version of this code only looked for `\n\n` and never
+      // found a single frame — every streaming response from Code Assist was
+      // truncated to whatever the (broken) flush path happened to salvage.
       let buffer = ''
+
+      function processFrame(frame: string): void {
+        // A single SSE event may contain multiple `data:` lines; per the spec
+        // they are concatenated with `\n`. Code Assist only ever sends one
+        // `data:` line per event today, but we handle the general case.
+        const dataLines: string[] = []
+        for (const rawLine of frame.split('\n')) {
+          const line = rawLine.trim()
+          if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart())
+          }
+        }
+        if (dataLines.length === 0) return
+        const payload = dataLines.join('\n').trim()
+        if (!payload || payload === '[DONE]') return
+        try {
+          processPayload(JSON.parse(payload), controller)
+        } catch {
+          // Malformed frame — skip.
+        }
+      }
+
       try {
         while (true) {
           const { value, done } = await reader.read()
           if (done) break
-          buffer += decoder.decode(value, { stream: true })
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
           let idx: number
           while ((idx = buffer.indexOf('\n\n')) !== -1) {
             const frame = buffer.slice(0, idx)
             buffer = buffer.slice(idx + 2)
-            const dataLine = frame
-              .split('\n')
-              .map(l => l.trim())
-              .find(l => l.startsWith('data:'))
-            if (!dataLine) continue
-            const payload = dataLine.slice(5).trim()
-            if (!payload || payload === '[DONE]') continue
-            try {
-              processPayload(JSON.parse(payload), controller)
-            } catch {
-              // Malformed frame — skip.
-            }
+            processFrame(frame)
           }
         }
-        // Flush any trailing frame.
-        if (buffer.trim()) {
-          const dataLine = buffer
-            .split('\n')
-            .map(l => l.trim())
-            .find(l => l.startsWith('data:'))
-          if (dataLine) {
-            const payload = dataLine.slice(5).trim()
-            if (payload && payload !== '[DONE]') {
-              try {
-                processPayload(JSON.parse(payload), controller)
-              } catch {
-                /* ignore */
-              }
-            }
-          }
+        // Flush any trailing frame that didn't end with a blank line.
+        if (buffer.trim().length > 0) {
+          processFrame(buffer)
+          buffer = ''
         }
         controller.enqueue(
           encodeChunk(
