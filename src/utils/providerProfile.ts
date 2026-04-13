@@ -19,6 +19,10 @@ export const PROFILE_FILE_NAME = '.openclaude-profile.json'
 export const DEFAULT_GEMINI_BASE_URL =
   'https://generativelanguage.googleapis.com/v1beta/openai'
 export const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
+// Code Assist (cli-oauth mode) only serves gemini-2.5-pro on the free tier
+// that backs "Login with Google" Gemini CLI users. Keep this in sync with the
+// fallback in createOpenAIShimClient.
+export const DEFAULT_GEMINI_CLI_OAUTH_MODEL = 'gemini-2.5-pro'
 export const DEFAULT_MISTRAL_BASE_URL = 'https://api.mistral.ai/v1'
 export const DEFAULT_MISTRAL_MODEL = 'devstral-latest'
 
@@ -258,7 +262,9 @@ export function buildGeminiProfileEnv(options: {
         { GEMINI_API_KEY: key },
         processEnv,
       ) ||
-      (authMode === 'cli-oauth' ? 'gemini-2.5-pro' : DEFAULT_GEMINI_MODEL),
+      (authMode === 'cli-oauth'
+        ? DEFAULT_GEMINI_CLI_OAUTH_MODEL
+        : DEFAULT_GEMINI_MODEL),
   }
 
   if (authMode === 'api-key' && key) {
@@ -546,21 +552,27 @@ export async function buildLaunchEnv(options: {
     delete env.CLAUDE_CODE_USE_OPENAI
     delete env.CLAUDE_CODE_USE_GITHUB
 
-    env.GEMINI_MODEL =
-      shellGeminiModel ||
-      persistedGeminiModel ||
-      DEFAULT_GEMINI_MODEL
-    env.GEMINI_BASE_URL =
-      shellGeminiBaseUrl ||
-      persistedGeminiBaseUrl ||
-      DEFAULT_GEMINI_BASE_URL
-
     const geminiAuthMode =
       persistedGeminiAuthMode === 'access-token' ||
       persistedGeminiAuthMode === 'adc' ||
       persistedGeminiAuthMode === 'cli-oauth'
         ? persistedGeminiAuthMode
         : 'api-key'
+
+    // cli-oauth profiles must default to the Code Assist model — the standard
+    // Gemini API default does not work against cloudcode-pa.googleapis.com.
+    const fallbackGeminiModel =
+      geminiAuthMode === 'cli-oauth'
+        ? DEFAULT_GEMINI_CLI_OAUTH_MODEL
+        : DEFAULT_GEMINI_MODEL
+    env.GEMINI_MODEL =
+      shellGeminiModel ||
+      persistedGeminiModel ||
+      fallbackGeminiModel
+    env.GEMINI_BASE_URL =
+      shellGeminiBaseUrl ||
+      persistedGeminiBaseUrl ||
+      DEFAULT_GEMINI_BASE_URL
     const geminiKey = shellGeminiKey || persistedGeminiKey
     if (geminiAuthMode === 'api-key' && geminiKey) {
       env.GEMINI_API_KEY = geminiKey

@@ -388,17 +388,22 @@ describe('geminiCodeAssistFetch', () => {
     expect(body.error?.message).toContain('messages')
   })
 
-  test('on a 401 response, force-refreshes the OAuth token and retries once', async () => {
+  test('on a 401 response, force-refreshes the OAuth token and retries once with the fresh token on the wire', async () => {
     const refreshCalls: Array<boolean | undefined> = []
-    const fetchBodies: string[] = []
-    let fetchCall = 0
+    const fetchAttempts: Array<{
+      authorization: string | undefined
+      body: Record<string, unknown>
+    }> = []
     const fakeFetch = (async (
       _url: string | URL | Request,
       init?: RequestInit,
     ) => {
-      fetchCall++
-      fetchBodies.push(init?.body as string)
-      if (fetchCall === 1) {
+      const headers = init?.headers as Record<string, string> | undefined
+      fetchAttempts.push({
+        authorization: headers?.Authorization ?? headers?.authorization,
+        body: JSON.parse(init?.body as string),
+      })
+      if (fetchAttempts.length === 1) {
         return new Response(JSON.stringify({ error: 'token expired' }), {
           status: 401,
         })
@@ -434,7 +439,18 @@ describe('geminiCodeAssistFetch', () => {
 
     expect(response.ok).toBe(true)
     expect(refreshCalls).toEqual([false, true])
-    expect(fetchCall).toBe(2)
+    expect(fetchAttempts).toHaveLength(2)
+    // First attempt used the stale cached token.
+    expect(fetchAttempts[0].authorization).toBe('Bearer stale-token')
+    // Retry MUST send the freshly refreshed token, not the stale one.
+    expect(fetchAttempts[1].authorization).toBe('Bearer fresh-token')
+    // Both attempts send the same translated payload — the body shouldn't
+    // be re-translated between retries.
+    expect(fetchAttempts[0].body).toEqual(fetchAttempts[1].body)
+    expect((fetchAttempts[1].body as { model: string }).model).toBe(
+      'gemini-2.5-pro',
+    )
+
     const json = (await response.json()) as {
       choices: Array<{ message: { content: string } }>
     }

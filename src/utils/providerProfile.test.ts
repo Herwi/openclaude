@@ -431,6 +431,25 @@ test('cli-oauth gemini profile round-trips through buildLaunchEnv without leakin
   assert.equal(env.GEMINI_ACCESS_TOKEN, undefined)
 })
 
+test('cli-oauth gemini profile defaults GEMINI_MODEL to gemini-2.5-pro when neither shell nor persisted set it', async () => {
+  // Catches a real footgun: a cli-oauth profile that somehow ends up without
+  // GEMINI_MODEL (older profile format, hand-edited file, etc.) must not
+  // launch with the standard Gemini API default — Code Assist free tier does
+  // not serve gemini-2.0-flash and the request would fail with an opaque
+  // upstream error.
+  const env = await buildLaunchEnv({
+    profile: 'gemini',
+    persisted: profile('gemini', {
+      GEMINI_AUTH_MODE: 'cli-oauth',
+    }),
+    goal: 'balanced',
+    processEnv: {},
+  })
+
+  assert.equal(env.GEMINI_AUTH_MODE, 'cli-oauth')
+  assert.equal(env.GEMINI_MODEL, 'gemini-2.5-pro')
+})
+
 test('saveProfileFile writes a profile that loadProfileFile can read back', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'openclaude-profile-file-'))
 
