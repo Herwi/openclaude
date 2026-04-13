@@ -63,6 +63,127 @@ function extractThoughtSignature(
   return value
 }
 
+/**
+ * Code Assist's `v1internal:generateContent` validates tool schemas against a
+ * strict OpenAPI 3.0 subset. It is dramatically stricter than Google's
+ * OpenAI-compat layer and stricter than `normalizeSchemaForOpenAI` cleans up
+ * for. Unknown JSON Schema keywords produce 400 INVALID_ARGUMENT, killing the
+ * request before it ever reaches the model. This sanitizer uses an allow-list
+ * of keys the server accepts and drops everything else.
+ *
+ * Transformations applied (beyond stripping):
+ *   - `const: X` is rewritten to `enum: [X]` because Gemini accepts enum but
+ *     has no `const` keyword.
+ *   - `oneOf` is rewritten to `anyOf` because Gemini only implements anyOf.
+ *     This is a small semantic loosening (exclusive-or → inclusive-or) but
+ *     is what the generative Gemini API itself expects.
+ *   - `allOf` is dropped (merging is non-trivial and Gemini can't verify it).
+ *   - `type: 'null'` or `type: ['string', 'null']` is rewritten to
+ *     `nullable: true` + single concrete type.
+ *   - `required` is filtered to property names that survived sanitization, so
+ *     we never ask for a field that no longer exists.
+ */
+const CODE_ASSIST_NUMERIC_KEYS = [
+  'minimum',
+  'maximum',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+  'minProperties',
+  'maxProperties',
+  'pattern',
+] as const
+
+export function sanitizeSchemaForCodeAssist(input: unknown): Record<string, unknown> {
+  if (Array.isArray(input) || !input || typeof input !== 'object') {
+    return {}
+  }
+  const schema = input as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+
+  // ---- type + nullable ----
+  const typeValue = schema.type
+  let nullable = false
+  if (Array.isArray(typeValue)) {
+    const nonNull: string[] = []
+    for (const t of typeValue) {
+      if (t === 'null') nullable = true
+      else if (typeof t === 'string') nonNull.push(t)
+    }
+    // Gemini's single-type field cannot express a union; pick the first
+    // concrete type. This loses information but is the closest thing
+    // representable.
+    if (nonNull.length >= 1) out.type = nonNull[0]
+  } else if (typeValue === 'null') {
+    nullable = true
+  } else if (typeof typeValue === 'string') {
+    out.type = typeValue
+  }
+  if (nullable) out.nullable = true
+  if (schema.nullable === true) out.nullable = true
+
+  // ---- description / title ----
+  if (typeof schema.description === 'string') out.description = schema.description
+  if (typeof schema.title === 'string') out.title = schema.title
+
+  // ---- enum / const ----
+  // A real enum on the source wins over a const. Otherwise promote const.
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    out.enum = [...schema.enum]
+  } else if ('const' in schema) {
+    out.enum = [schema.const]
+  }
+
+  // ---- properties (recurse) ----
+  if (
+    schema.properties &&
+    typeof schema.properties === 'object' &&
+    !Array.isArray(schema.properties)
+  ) {
+    const props: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(schema.properties)) {
+      props[k] = sanitizeSchemaForCodeAssist(v)
+    }
+    out.properties = props
+  }
+
+  // ---- items (recurse) ----
+  if ('items' in schema && schema.items != null) {
+    out.items = Array.isArray(schema.items)
+      ? schema.items.map(sanitizeSchemaForCodeAssist)
+      : sanitizeSchemaForCodeAssist(schema.items)
+  }
+
+  // ---- anyOf / oneOf (drop allOf) ----
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    out.anyOf = schema.anyOf.map(sanitizeSchemaForCodeAssist)
+  } else if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    out.anyOf = schema.oneOf.map(sanitizeSchemaForCodeAssist)
+  }
+
+  // ---- numeric / string / array constraints (pass-through) ----
+  for (const key of CODE_ASSIST_NUMERIC_KEYS) {
+    if (key in schema) out[key] = schema[key]
+  }
+
+  // ---- required (filter to surviving property names) ----
+  if (Array.isArray(schema.required)) {
+    const propNames =
+      out.properties && typeof out.properties === 'object'
+        ? Object.keys(out.properties as Record<string, unknown>)
+        : null
+    const filtered = (schema.required as unknown[]).filter(
+      (r): r is string =>
+        typeof r === 'string' &&
+        (propNames === null || propNames.includes(r)),
+    )
+    if (filtered.length > 0) out.required = filtered
+  }
+
+  return out
+}
+
 type OpenAIToolLike = {
   type: 'function'
   function: {
@@ -322,7 +443,15 @@ export function translateOpenAIRequestToGemini(
             name: t.function.name,
           }
           if (t.function.description) decl.description = t.function.description
-          if (t.function.parameters) decl.parameters = t.function.parameters
+          if (t.function.parameters) {
+            // Code Assist is significantly stricter than Google's OpenAI-compat
+            // layer: it rejects JSON Schema keywords Claude Code's tool schemas
+            // use (const, exclusiveMinimum, oneOf, additionalProperties, …).
+            // Run every tool parameter schema through our Gemini-native
+            // sanitizer here — not in openaiShim — so the transport boundary
+            // is the single source of truth for "what Code Assist will accept".
+            decl.parameters = sanitizeSchemaForCodeAssist(t.function.parameters)
+          }
           return decl
         }),
       },

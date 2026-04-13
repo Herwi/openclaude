@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   geminiCodeAssistFetch,
+  sanitizeSchemaForCodeAssist,
   translateGeminiResponseToOpenAI,
   translateOpenAIRequestToGemini,
 } from './geminiCodeAssistTransport.ts'
@@ -185,6 +186,251 @@ describe('translateOpenAIRequestToGemini', () => {
     })
     expect(gemini.contents).toHaveLength(1)
     expect(gemini.contents[0].parts).toEqual([{ text: 'a' }, { text: 'b' }])
+  })
+})
+
+describe('sanitizeSchemaForCodeAssist', () => {
+  // Regression for a real user report: Code Assist rejected tool schemas
+  // containing "exclusiveMinimum" and "const" with 400 INVALID_ARGUMENT.
+
+  test('strips exclusiveMinimum / exclusiveMaximum', () => {
+    const out = sanitizeSchemaForCodeAssist({
+      type: 'integer',
+      minimum: 0,
+      exclusiveMinimum: 0,
+      maximum: 100,
+      exclusiveMaximum: 100,
+    })
+    expect(out).toEqual({ type: 'integer', minimum: 0, maximum: 100 })
+    expect('exclusiveMinimum' in out).toBe(false)
+    expect('exclusiveMaximum' in out).toBe(false)
+  })
+
+  test('rewrites const to a single-value enum', () => {
+    expect(sanitizeSchemaForCodeAssist({ const: 'foo' })).toEqual({
+      enum: ['foo'],
+    })
+    expect(
+      sanitizeSchemaForCodeAssist({ type: 'string', const: 'foo' }),
+    ).toEqual({ type: 'string', enum: ['foo'] })
+  })
+
+  test('existing enum wins over const', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'string',
+        enum: ['a', 'b'],
+        const: 'z',
+      }),
+    ).toEqual({ type: 'string', enum: ['a', 'b'] })
+  })
+
+  test('rewrites oneOf to anyOf', () => {
+    const out = sanitizeSchemaForCodeAssist({
+      oneOf: [{ const: 'foo' }, { const: 'bar' }],
+    })
+    expect(out).toEqual({
+      anyOf: [{ enum: ['foo'] }, { enum: ['bar'] }],
+    })
+  })
+
+  test('drops allOf silently', () => {
+    const out = sanitizeSchemaForCodeAssist({
+      type: 'object',
+      allOf: [{ type: 'object', properties: { x: { type: 'number' } } }],
+    })
+    expect('allOf' in out).toBe(false)
+    expect(out.type).toBe('object')
+  })
+
+  test('strips additionalProperties, patternProperties, $schema, $ref, default', () => {
+    const out = sanitizeSchemaForCodeAssist({
+      type: 'object',
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $ref: '#/definitions/Foo',
+      default: {},
+      additionalProperties: false,
+      patternProperties: { '^x': { type: 'string' } },
+      properties: { a: { type: 'string' } },
+    })
+    expect(out).toEqual({
+      type: 'object',
+      properties: { a: { type: 'string' } },
+    })
+  })
+
+  test('strips format keyword', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'string',
+        format: 'path',
+      }),
+    ).toEqual({ type: 'string' })
+  })
+
+  test('recurses into properties', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'object',
+        properties: {
+          count: {
+            type: 'integer',
+            minimum: 0,
+            exclusiveMinimum: 0,
+          },
+          mode: { const: 'fast' },
+        },
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: {
+        count: { type: 'integer', minimum: 0 },
+        mode: { enum: ['fast'] },
+      },
+    })
+  })
+
+  test('recurses into array items', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'array',
+        items: { type: 'object', properties: { tag: { const: 'x' } } },
+      }),
+    ).toEqual({
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { tag: { enum: ['x'] } },
+      },
+    })
+  })
+
+  test('recurses into anyOf branches', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        anyOf: [
+          { type: 'string', const: 'fast' },
+          { type: 'integer', exclusiveMinimum: 0 },
+        ],
+      }),
+    ).toEqual({
+      anyOf: [
+        { type: 'string', enum: ['fast'] },
+        { type: 'integer' },
+      ],
+    })
+  })
+
+  test('converts type arrays and null types to nullable + single type', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({ type: ['string', 'null'] }),
+    ).toEqual({ type: 'string', nullable: true })
+
+    expect(sanitizeSchemaForCodeAssist({ type: 'null' })).toEqual({
+      nullable: true,
+    })
+  })
+
+  test('preserves an explicit nullable: true', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({ type: 'string', nullable: true }),
+    ).toEqual({ type: 'string', nullable: true })
+  })
+
+  test('filters required to properties that survived sanitization', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'object',
+        required: ['a', 'b', 'ghost'],
+        properties: {
+          a: { type: 'string' },
+          b: { type: 'string' },
+        },
+      }),
+    ).toEqual({
+      type: 'object',
+      required: ['a', 'b'],
+      properties: {
+        a: { type: 'string' },
+        b: { type: 'string' },
+      },
+    })
+  })
+
+  test('passes through supported numeric/string/array constraints', () => {
+    expect(
+      sanitizeSchemaForCodeAssist({
+        type: 'array',
+        minItems: 1,
+        maxItems: 10,
+        items: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 50,
+          pattern: '^[a-z]+$',
+        },
+      }),
+    ).toEqual({
+      type: 'array',
+      minItems: 1,
+      maxItems: 10,
+      items: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 50,
+        pattern: '^[a-z]+$',
+      },
+    })
+  })
+
+  test('end-to-end: sanitization flows through translateOpenAIRequestToGemini tools mapping', () => {
+    // Synthesises the exact offending shape from the real user report:
+    // properties with both const-inside-oneOf and exclusiveMinimum on a
+    // numeric field. Previously this hit the wire unchanged and Code Assist
+    // returned 400 INVALID_ARGUMENT.
+    const gemini = translateOpenAIRequestToGemini({
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'TestTool',
+            description: 'Demonstrates hostile input',
+            parameters: {
+              type: 'object',
+              properties: {
+                count: {
+                  type: 'integer',
+                  minimum: 1,
+                  exclusiveMinimum: 1,
+                },
+                mode: {
+                  oneOf: [{ const: 'fast' }, { const: 'slow' }],
+                },
+              },
+              required: ['count'],
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+    })
+    expect(gemini.tools).toHaveLength(1)
+    const decl = gemini.tools![0].functionDeclarations[0]
+    expect(decl.parameters).toEqual({
+      type: 'object',
+      properties: {
+        count: { type: 'integer', minimum: 1 },
+        mode: { anyOf: [{ enum: ['fast'] }, { enum: ['slow'] }] },
+      },
+      required: ['count'],
+    })
+    // No unsupported keys anywhere in the declared schema.
+    const serialized = JSON.stringify(decl.parameters)
+    expect(serialized).not.toContain('exclusiveMinimum')
+    expect(serialized).not.toContain('"const"')
+    expect(serialized).not.toContain('oneOf')
+    expect(serialized).not.toContain('additionalProperties')
   })
 })
 
