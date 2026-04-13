@@ -23,7 +23,8 @@
 
 import { APIError } from '@anthropic-ai/sdk'
 import { isEnvTruthy } from '../../utils/envUtils.js'
-import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
+import { getGeminiAuthMode, resolveGeminiCredential } from '../../utils/geminiAuth.js'
+import { geminiCodeAssistFetch } from './geminiCodeAssistTransport.js'
 import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
 import { hydrateGithubModelsTokenFromSecureStorage } from '../../utils/githubModelsCredentials.js'
 import {
@@ -1332,10 +1333,29 @@ class OpenAIShimMessages {
       signal: options?.signal,
     }
 
+    // When Gemini is active in `cli-oauth` mode, divert the HTTP call through
+    // the Code Assist transport adapter. It speaks Gemini-native
+    // generateContent on the wire but returns an OpenAI-shaped Response that
+    // the downstream parser already understands.
+    const useGeminiCliOAuth =
+      isGemini && getGeminiAuthMode(process.env) === 'cli-oauth'
+
     const maxAttempts = isGithub ? GITHUB_429_MAX_RETRIES : 1
     let response: Response | undefined
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      response = await fetch(chatCompletionsUrl, fetchInit)
+      if (useGeminiCliOAuth) {
+        response = await geminiCodeAssistFetch({
+          body: body as Parameters<typeof geminiCodeAssistFetch>[0]['body'],
+          signal: options?.signal,
+          model:
+            (body.model as string | undefined) ??
+            request.resolvedModel ??
+            process.env.GEMINI_MODEL ??
+            'gemini-2.5-pro',
+        })
+      } else {
+        response = await fetch(chatCompletionsUrl, fetchInit)
+      }
       if (response.ok) {
         return response
       }
@@ -1590,6 +1610,7 @@ export function createOpenAIShimClient(options: {
   // When Gemini provider is active, map Gemini env vars to OpenAI-compatible ones
   // so the existing providerConfig.ts infrastructure picks them up correctly.
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
+    const isCliOAuth = getGeminiAuthMode(process.env) === 'cli-oauth'
     process.env.OPENAI_BASE_URL ??=
       process.env.GEMINI_BASE_URL ??
       'https://generativelanguage.googleapis.com/v1beta/openai'
@@ -1597,6 +1618,16 @@ export function createOpenAIShimClient(options: {
       process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY
     if (geminiApiKey && !process.env.OPENAI_API_KEY) {
       process.env.OPENAI_API_KEY = geminiApiKey
+    }
+    // In cli-oauth mode we don't have an API key to set; put a placeholder so
+    // downstream code that checks for its presence doesn't treat the request
+    // as unauthenticated. The real bearer token is attached inside
+    // geminiCodeAssistFetch().
+    if (isCliOAuth && !process.env.OPENAI_API_KEY) {
+      process.env.OPENAI_API_KEY = 'gemini-cli-oauth'
+    }
+    if (isCliOAuth && !process.env.GEMINI_MODEL) {
+      process.env.GEMINI_MODEL = 'gemini-2.5-pro'
     }
     if (process.env.GEMINI_MODEL && !process.env.OPENAI_MODEL) {
       process.env.OPENAI_MODEL = process.env.GEMINI_MODEL

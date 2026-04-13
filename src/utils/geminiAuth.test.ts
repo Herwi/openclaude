@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   getGeminiProjectIdHint,
@@ -17,6 +20,7 @@ const originalEnv = {
   GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT,
   GCLOUD_PROJECT: process.env.GCLOUD_PROJECT,
   GOOGLE_PROJECT_ID: process.env.GOOGLE_PROJECT_ID,
+  GEMINI_CLI_OAUTH_PATH: process.env.GEMINI_CLI_OAUTH_PATH,
   APPDATA: process.env.APPDATA,
 }
 
@@ -40,6 +44,7 @@ afterEach(() => {
   restoreEnv('GOOGLE_CLOUD_PROJECT', originalEnv.GOOGLE_CLOUD_PROJECT)
   restoreEnv('GCLOUD_PROJECT', originalEnv.GCLOUD_PROJECT)
   restoreEnv('GOOGLE_PROJECT_ID', originalEnv.GOOGLE_PROJECT_ID)
+  restoreEnv('GEMINI_CLI_OAUTH_PATH', originalEnv.GEMINI_CLI_OAUTH_PATH)
   restoreEnv('APPDATA', originalEnv.APPDATA)
 })
 
@@ -97,6 +102,50 @@ describe('resolveGeminiCredential', () => {
       kind: 'adc',
       credential: 'adc-token',
       projectId: 'adc-project',
+    })
+  })
+
+  test('cli-oauth mode reads Gemini CLI credentials and returns them as a cli-oauth credential', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gemini-auth-cli-oauth-'))
+    try {
+      const path = join(dir, 'oauth_creds.json')
+      writeFileSync(
+        path,
+        JSON.stringify({
+          access_token: 'cli-token',
+          refresh_token: 'r',
+          // Far future so no refresh HTTP call is attempted.
+          expiry_date: Date.now() + 24 * 60 * 60 * 1000,
+        }),
+      )
+      delete process.env.GEMINI_API_KEY
+      delete process.env.GOOGLE_API_KEY
+      delete process.env.GEMINI_ACCESS_TOKEN
+      // Project hint avoids a network call to loadCodeAssist.
+      process.env.GOOGLE_CLOUD_PROJECT = 'proj-cli'
+      process.env.GEMINI_AUTH_MODE = 'cli-oauth'
+      process.env.GEMINI_CLI_OAUTH_PATH = path
+
+      await expect(resolveGeminiCredential(process.env)).resolves.toEqual({
+        kind: 'cli-oauth',
+        credential: 'cli-token',
+        projectId: 'proj-cli',
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('cli-oauth mode returns none when credentials file is missing', async () => {
+    delete process.env.GEMINI_API_KEY
+    delete process.env.GOOGLE_API_KEY
+    delete process.env.GEMINI_ACCESS_TOKEN
+    delete process.env.GOOGLE_CLOUD_PROJECT
+    process.env.GEMINI_AUTH_MODE = 'cli-oauth'
+    process.env.GEMINI_CLI_OAUTH_PATH = '/definitely/not/here.json'
+
+    await expect(resolveGeminiCredential(process.env)).resolves.toEqual({
+      kind: 'none',
     })
   })
 

@@ -49,6 +49,8 @@ import {
   readGeminiAccessToken,
   saveGeminiAccessToken,
 } from '../../utils/geminiCredentials.js'
+import { existsSync } from 'node:fs'
+import { getGeminiCliOAuthPath } from '../../utils/geminiCliOAuth.js'
 import {
   getGoalDefaultOpenAIModel,
   normalizeRecommendationGoal,
@@ -91,7 +93,7 @@ type Step =
   | {
       name: 'gemini-model'
       apiKey?: string
-      authMode: 'api-key' | 'access-token' | 'adc'
+      authMode: 'api-key' | 'access-token' | 'adc' | 'cli-oauth'
     }
   | { name: 'codex-check' }
 
@@ -291,6 +293,8 @@ function buildSavedProfileSummary(
             ? 'access token (stored securely)'
             : env.GEMINI_AUTH_MODE === 'adc'
               ? 'local ADC'
+              : env.GEMINI_AUTH_MODE === 'cli-oauth'
+                ? 'Gemini CLI login (experimental)'
             : maskSecretForDisplay(env.GEMINI_API_KEY) !== undefined
               ? 'configured'
               : undefined,
@@ -1277,6 +1281,8 @@ export function ProviderWizard({
       const hasStoredGeminiAccessToken = Boolean(readGeminiAccessToken())
       const hasAdc = mayHaveGeminiAdcCredentials(process.env)
       const projectHint = getGeminiProjectIdHint(process.env)
+      const geminiCliOAuthPath = getGeminiCliOAuthPath(process.env)
+      const hasGeminiCliOAuth = existsSync(geminiCliOAuthPath)
 
       const options: OptionWithDescription[] = [
         {
@@ -1304,6 +1310,13 @@ export function ProviderWizard({
             ? `Use local Google ADC credentials${projectHint ? ` (project: ${projectHint})` : ''}`
             : 'Use local Google ADC credentials after running gcloud auth application-default login',
         },
+        {
+          label: 'Gemini CLI login (experimental)',
+          value: 'cli-oauth',
+          description: hasGeminiCliOAuth
+            ? `Reuse the Google login from ~/.gemini/oauth_creds.json via Code Assist`
+            : `Run \`gemini\` once and log in, then reuse that Google login`,
+        },
       ]
 
       return (
@@ -1319,6 +1332,11 @@ export function ProviderWizard({
                   setStep({ name: 'gemini-key' })
                 } else if (value === 'access-token') {
                   setStep({ name: 'gemini-access-token' })
+                } else if (value === 'cli-oauth') {
+                  setStep({
+                    name: 'gemini-model',
+                    authMode: 'cli-oauth',
+                  })
                 } else {
                   setStep({
                     name: 'gemini-model',
@@ -1423,10 +1441,18 @@ export function ProviderWizard({
               ? `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}.`
               : step.authMode === 'access-token'
                 ? `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}. This profile will use the stored Gemini access token at runtime.`
-                : `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}. This profile will use local Google ADC credentials at runtime.`
+                : step.authMode === 'cli-oauth'
+                  ? `Enter a Gemini model name. Leave blank for gemini-2.5-pro. This profile will reuse the Gemini CLI OAuth credentials at ~/.gemini/oauth_creds.json via Code Assist at runtime. To allow automatic token refresh, also set GEMINI_CLI_OAUTH_CLIENT_ID and GEMINI_CLI_OAUTH_CLIENT_SECRET in your shell (values are in the @google/gemini-cli npm package).`
+                  : `Enter a Gemini model name. Leave blank for ${DEFAULT_GEMINI_MODEL}. This profile will use local Google ADC credentials at runtime.`
           }
-          initialValue={defaults.geminiModel}
-          placeholder={DEFAULT_GEMINI_MODEL}
+          initialValue={
+            step.authMode === 'cli-oauth'
+              ? defaults.geminiModel || 'gemini-2.5-pro'
+              : defaults.geminiModel
+          }
+          placeholder={
+            step.authMode === 'cli-oauth' ? 'gemini-2.5-pro' : DEFAULT_GEMINI_MODEL
+          }
           allowEmpty
           onSubmit={value => {
             if (
@@ -1442,10 +1468,25 @@ export function ProviderWizard({
               return
             }
 
+            if (
+              step.authMode === 'cli-oauth' &&
+              !existsSync(getGeminiCliOAuthPath(process.env))
+            ) {
+              onDone(
+                'Gemini CLI credentials were not detected. Install and run `gemini` once ("Login with Google") before saving this profile.',
+                {
+                  display: 'system',
+                },
+              )
+              return
+            }
+
+            const fallback =
+              step.authMode === 'cli-oauth' ? 'gemini-2.5-pro' : DEFAULT_GEMINI_MODEL
             const env = buildGeminiProfileEnv({
               apiKey: step.apiKey,
               authMode: step.authMode,
-              model: value.trim() || DEFAULT_GEMINI_MODEL,
+              model: value.trim() || fallback,
               processEnv: {},
             })
             if (env) {

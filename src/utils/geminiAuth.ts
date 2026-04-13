@@ -7,7 +7,7 @@ import { memoizeWithTTLAsync } from './memoize.js'
 const GEMINI_ADC_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
 const GEMINI_ADC_CACHE_TTL_MS = 5 * 60 * 1000
 
-export type GeminiAuthMode = 'api-key' | 'access-token' | 'adc'
+export type GeminiAuthMode = 'api-key' | 'access-token' | 'adc' | 'cli-oauth'
 
 type GoogleAccessTokenResult =
   | string
@@ -32,7 +32,7 @@ export type GeminiResolvedCredential =
       credential: string
     }
   | {
-      kind: 'access-token' | 'adc'
+      kind: 'access-token' | 'adc' | 'cli-oauth'
       credential: string
       projectId?: string
     }
@@ -66,7 +66,8 @@ export function getGeminiAuthMode(
   if (
     normalized === 'api-key' ||
     normalized === 'access-token' ||
-    normalized === 'adc'
+    normalized === 'adc' ||
+    normalized === 'cli-oauth'
   ) {
     return normalized
   }
@@ -174,6 +175,29 @@ export async function resolveGeminiCredential(
   deps: ResolveGeminiCredentialDeps = {},
 ): Promise<GeminiResolvedCredential> {
   const authMode = getGeminiAuthMode(env)
+
+  if (authMode === 'cli-oauth') {
+    try {
+      const { loadGeminiCliOAuthToken, resolveGeminiCliProjectId } = await import(
+        './geminiCliOAuth.js'
+      )
+      const token = await loadGeminiCliOAuthToken()
+      let projectId: string | undefined
+      try {
+        projectId = await resolveGeminiCliProjectId(token.accessToken, { env })
+      } catch {
+        projectId = getGeminiProjectIdHint(env)
+      }
+      return {
+        kind: 'cli-oauth',
+        credential: token.accessToken,
+        ...(projectId ? { projectId } : {}),
+      }
+    } catch {
+      return { kind: 'none' }
+    }
+  }
+
   const apiKey =
     authMode === 'access-token' || authMode === 'adc'
       ? undefined

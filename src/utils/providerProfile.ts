@@ -64,7 +64,7 @@ export type ProfileEnv = {
   CHATGPT_ACCOUNT_ID?: string
   CODEX_ACCOUNT_ID?: string
   GEMINI_API_KEY?: string
-  GEMINI_AUTH_MODE?: 'api-key' | 'access-token' | 'adc'
+  GEMINI_AUTH_MODE?: 'api-key' | 'access-token' | 'adc' | 'cli-oauth'
   GEMINI_MODEL?: string
   GEMINI_BASE_URL?: string
   MISTRAL_BASE_URL?: string
@@ -235,7 +235,7 @@ export function buildGeminiProfileEnv(options: {
   model?: string | null
   baseUrl?: string | null
   apiKey?: string | null
-  authMode?: 'api-key' | 'access-token' | 'adc'
+  authMode?: 'api-key' | 'access-token' | 'adc' | 'cli-oauth'
   processEnv?: NodeJS.ProcessEnv
 }): ProfileEnv | null {
   const processEnv = options.processEnv ?? process.env
@@ -258,7 +258,7 @@ export function buildGeminiProfileEnv(options: {
         { GEMINI_API_KEY: key },
         processEnv,
       ) ||
-      DEFAULT_GEMINI_MODEL,
+      (authMode === 'cli-oauth' ? 'gemini-2.5-pro' : DEFAULT_GEMINI_MODEL),
   }
 
   if (authMode === 'api-key' && key) {
@@ -557,7 +557,8 @@ export async function buildLaunchEnv(options: {
 
     const geminiAuthMode =
       persistedGeminiAuthMode === 'access-token' ||
-      persistedGeminiAuthMode === 'adc'
+      persistedGeminiAuthMode === 'adc' ||
+      persistedGeminiAuthMode === 'cli-oauth'
         ? persistedGeminiAuthMode
         : 'api-key'
     const geminiKey = shellGeminiKey || persistedGeminiKey
