@@ -199,14 +199,25 @@ Free tier at [firecrawl.dev](https://firecrawl.dev) includes 500 credits. The ke
 - Optionally set `GOOGLE_CLOUD_PROJECT` to skip the Code Assist project lookup call. If unset, the transport calls `loadCodeAssist` on first use and caches the returned `cloudaicompanionProject` for ten minutes.
 - If you want OpenClaude to refresh its own access token when the cached one expires (rather than requiring you to re-run `gemini`), also export the public OAuth client values the Gemini CLI itself uses. They live in the published `@google/gemini-cli` npm package under `packages/core/src/code_assist/oauth2.ts`. Copy them into your shell:
 
+  macOS / Linux:
+
   ```bash
   export GEMINI_CLI_OAUTH_CLIENT_ID=<client_id_from_gemini_cli_source>
   export GEMINI_CLI_OAUTH_CLIENT_SECRET=<client_secret_from_gemini_cli_source>
   ```
 
+  Windows PowerShell:
+
+  ```powershell
+  $env:GEMINI_CLI_OAUTH_CLIENT_ID="<client_id_from_gemini_cli_source>"
+  $env:GEMINI_CLI_OAUTH_CLIENT_SECRET="<client_secret_from_gemini_cli_source>"
+  ```
+
   These are not stored in this repository. If both are missing and the cached token is still valid, OpenClaude will serve it without needing to refresh; if it is expired, the request fails with an actionable error instructing you to set these two env vars.
 
 ### Run
+
+macOS / Linux:
 
 ```bash
 export CLAUDE_CODE_USE_GEMINI=1
@@ -215,6 +226,19 @@ export GEMINI_AUTH_MODE=cli-oauth
 export GEMINI_MODEL=gemini-2.5-pro
 # Optional — skips the loadCodeAssist network call
 export GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+
+openclaude
+```
+
+Windows PowerShell:
+
+```powershell
+$env:CLAUDE_CODE_USE_GEMINI="1"
+$env:GEMINI_AUTH_MODE="cli-oauth"
+# Optional — defaults to gemini-2.5-pro (the only model Code Assist free tier serves)
+$env:GEMINI_MODEL="gemini-2.5-pro"
+# Optional — skips the loadCodeAssist network call
+$env:GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
 
 openclaude
 ```
